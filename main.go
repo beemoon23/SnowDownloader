@@ -37,6 +37,14 @@ func init() {
 }
 
 func main() {
+	// walk.InitApp() TEM que ser a primeira chamada da biblioteca de janela.
+	// É ela que registra a classe da janela principal; sem isso o Windows
+	// responde "CreateWindowEx" e a janela nunca abre.
+	if _, err := walk.InitApp(); err != nil {
+		walk.MsgBox(nil, appTitle, "Erro ao iniciar a interface:\n\n"+err.Error(), walk.MsgBoxIconError)
+		os.Exit(1)
+	}
+
 	a := &SnowApp{
 		table:    &JobTable{},
 		tools:    newToolPaths(),
