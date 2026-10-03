@@ -22,10 +22,15 @@ jobs:
       - name: Resolver dependências
         run: go mod tidy
 
-      - name: Embutir manifesto (visual moderno do Windows)
+      - name: Embutir manifesto e ícone
+        shell: pwsh
         run: |
           go install github.com/akavel/rsrc@latest
-          rsrc -manifest app.manifest -o rsrc.syso
+          if (Test-Path snow.ico) {
+            rsrc -manifest app.manifest -ico snow.ico -o rsrc.syso
+          } else {
+            rsrc -manifest app.manifest -o rsrc.syso
+          }
 
       - name: Checar o código
         run: go vet ./...
