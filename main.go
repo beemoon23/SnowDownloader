@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
@@ -23,6 +22,10 @@ type SnowApp struct {
 	table    *JobTable
 	tools    ToolPaths
 	settings AppSettings
+
+	ni       *walk.NotifyIcon // ícone/balões na bandeja
+	cellFont *walk.Font       // fonte usada para desenhar a barra de progresso
+	selRows  map[int]bool     // linhas selecionadas (só a thread da janela mexe)
 
 	qmu           sync.Mutex
 	queueRunning  bool
@@ -49,6 +52,7 @@ func main() {
 		table:    &JobTable{},
 		tools:    newToolPaths(),
 		settings: loadSettings(),
+		selRows:  map[int]bool{},
 	}
 	if err := a.run(); err != nil {
 		walk.MsgBox(nil, appTitle, "Erro ao abrir a janela:\n\n"+err.Error(), walk.MsgBoxIconError)
@@ -211,16 +215,130 @@ func (a *SnowApp) run() error {
 		return out
 	}
 
+	// ---- ações da lista (botões, menu do botão direito e duplo clique) ----
+
+	cancelSelected := func() {
+		for _, j := range selectedJobs() {
+			a.cancelJob(j)
+		}
+	}
+
+	retrySelected := func() {
+		sel := selectedJobs()
+		a.table.mu.Lock()
+		for _, j := range sel {
+			if j.State == stError || j.State == stCanceled {
+				j.State = stWaiting
+				j.canceled = false
+				j.Status = "Na fila"
+				j.Percent, j.Speed, j.ETA = "", "", ""
+				j.PctVal = 0
+				j.FilePath = ""
+			}
+		}
+		a.table.mu.Unlock()
+		a.table.PublishRowsReset()
+		a.maxConcurrent = concCB.CurrentIndex() + 1
+		a.startQueue()
+	}
+
+	clearDone := func() {
+		a.table.mu.Lock()
+		kept := make([]*DlJob, 0, len(a.table.items))
+		for _, j := range a.table.items {
+			if j.State == stWaiting || j.State == stRunning {
+				kept = append(kept, j)
+			}
+		}
+		a.table.items = kept
+		a.table.mu.Unlock()
+		a.selRows = map[int]bool{}
+		a.table.PublishRowsReset()
+	}
+
+	removeSelected := func() {
+		sel := selectedJobs()
+		if len(sel) == 0 {
+			return
+		}
+		drop := make(map[*DlJob]bool, len(sel))
+		for _, j := range sel {
+			a.cancelJob(j) // se estiver baixando, para antes de tirar
+			drop[j] = true
+		}
+		a.table.mu.Lock()
+		kept := make([]*DlJob, 0, len(a.table.items))
+		for _, j := range a.table.items {
+			if !drop[j] {
+				kept = append(kept, j)
+			}
+		}
+		a.table.items = kept
+		a.table.mu.Unlock()
+		a.selRows = map[int]bool{}
+		a.table.PublishRowsReset()
+	}
+
+	// fileOfFirstSelected devolve o arquivo do primeiro item selecionado,
+	// ou "" (e já avisa na barra de status) se não der para usar.
+	fileOfFirstSelected := func() string {
+		sel := selectedJobs()
+		if len(sel) == 0 {
+			return ""
+		}
+		a.table.mu.Lock()
+		p, st := sel[0].FilePath, sel[0].State
+		a.table.mu.Unlock()
+		switch {
+		case st != stDone:
+			a.statusLB.SetText("Esse download ainda não terminou.")
+			return ""
+		case p == "" || !fileExists(p):
+			a.statusLB.SetText("Não encontrei o arquivo (foi movido ou apagado?).")
+			return ""
+		}
+		return p
+	}
+
+	openSelected := func() {
+		if p := fileOfFirstSelected(); p != "" {
+			openFile(p)
+		}
+	}
+
+	showSelected := func() {
+		if p := fileOfFirstSelected(); p != "" {
+			showInFolder(p)
+		}
+	}
+
+	copyLinks := func() {
+		sel := selectedJobs()
+		if len(sel) == 0 {
+			return
+		}
+		urls := make([]string, 0, len(sel))
+		for _, j := range sel {
+			urls = append(urls, j.URL)
+		}
+		_ = walk.Clipboard().SetText(strings.Join(urls, "\r\n"))
+		a.statusLB.SetText(fmt.Sprintf("%d link(s) copiado(s).", len(urls)))
+	}
+
 	err := MainWindow{
 		AssignTo: &a.mw,
 		Title:    appTitle + " — baixe vídeos, lives, reels e áudios",
-		MinSize:  Size{Width: 760, Height: 460},
-		Size:     Size{Width: 960, Height: 620},
-		Layout:   VBox{},
+		MinSize:  Size{Width: 820, Height: 480},
+		Size:     Size{Width: 1000, Height: 660},
+		Font:     Font{Family: "Segoe UI", PointSize: 10},
+		Layout: VBox{
+			Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 10},
+			Spacing: 8,
+		},
 		Children: []Widget{
 			GroupBox{
 				Title:  "Cole o link (de qualquer site) e o download começa sozinho",
-				Layout: VBox{},
+				Layout: VBox{Margins: Margins{Left: 10, Top: 8, Right: 10, Bottom: 10}, Spacing: 8},
 				Children: []Widget{
 					TextEdit{
 						AssignTo: &urlEdit,
@@ -233,7 +351,7 @@ func (a *SnowApp) run() error {
 						Children: []Widget{
 							PushButton{
 								Text:      "📋  Colar e baixar",
-								MinSize:   Size{Width: 160, Height: 32},
+								MinSize:   Size{Width: 170, Height: 34},
 								OnClicked: pasteAndGo,
 							},
 							HSpacer{},
@@ -246,7 +364,7 @@ func (a *SnowApp) run() error {
 							},
 							PushButton{
 								Text:      "▶  Baixar",
-								MinSize:   Size{Width: 120, Height: 32},
+								MinSize:   Size{Width: 130, Height: 34},
 								OnClicked: addAndStart,
 							},
 						},
@@ -257,7 +375,7 @@ func (a *SnowApp) run() error {
 				AssignTo: &optsGB,
 				Visible:  false,
 				Title:    "Opções",
-				Layout:   VBox{},
+				Layout:   VBox{Margins: Margins{Left: 10, Top: 8, Right: 10, Bottom: 10}, Spacing: 8},
 				Children: []Widget{
 					Composite{
 						Layout: HBox{MarginsZero: true},
@@ -267,7 +385,7 @@ func (a *SnowApp) run() error {
 								AssignTo:     &qualityCB,
 								Model:        qualityNames(),
 								CurrentIndex: clamp(s.Quality, len(qualityOptions)),
-								MinSize:      Size{Width: 280},
+								MinSize:      Size{Width: 300},
 							},
 							Label{Text: "Cookies do navegador:"},
 							ComboBox{
@@ -321,15 +439,35 @@ func (a *SnowApp) run() error {
 				},
 			},
 			TableView{
-				AssignTo:         &tv,
-				AlternatingRowBG: true,
-				MultiSelection:   true,
-				ColumnsOrderable: false,
-				Model:            a.table,
+				AssignTo:            &tv,
+				AlternatingRowBG:    true,
+				MultiSelection:      true,
+				ColumnsOrderable:    false,
+				LastColumnStretched: true,
+				CustomRowHeight:     28,
+				Model:               a.table,
+				StyleCell:           a.styleCell,
+				OnItemActivated:     openSelected, // duplo clique / Enter abre o vídeo
+				OnSelectedIndexesChanged: func() {
+					m := make(map[int]bool)
+					for _, i := range tv.SelectedIndexes() {
+						m[i] = true
+					}
+					a.selRows = m
+				},
+				ContextMenuItems: []MenuItem{
+					Action{Text: "Abrir arquivo", OnTriggered: openSelected},
+					Action{Text: "Mostrar na pasta", OnTriggered: showSelected},
+					Action{Text: "Copiar link", OnTriggered: copyLinks},
+					Separator{},
+					Action{Text: "Cancelar", OnTriggered: cancelSelected},
+					Action{Text: "Tentar de novo", OnTriggered: retrySelected},
+					Action{Text: "Remover da lista", OnTriggered: removeSelected},
+				},
 				Columns: []TableViewColumn{
-					{Title: "Título / link", Width: 400},
-					{Title: "Status", Width: 230},
-					{Title: "Progresso", Width: 80},
+					{Title: "Título / link", Width: 380},
+					{Title: "Status", Width: 220},
+					{Title: "Progresso", Width: 140},
 					{Title: "Velocidade", Width: 100},
 					{Title: "Restante", Width: 80},
 				},
@@ -337,55 +475,16 @@ func (a *SnowApp) run() error {
 			Composite{
 				Layout: HBox{MarginsZero: true},
 				Children: []Widget{
-					PushButton{
-						Text: "Cancelar selecionados",
-						OnClicked: func() {
-							for _, j := range selectedJobs() {
-								a.cancelJob(j)
-							}
-						},
-					},
-					PushButton{
-						Text: "Tentar de novo",
-						OnClicked: func() {
-							sel := selectedJobs()
-							a.table.mu.Lock()
-							for _, j := range sel {
-								if j.State == stError || j.State == stCanceled {
-									j.State = stWaiting
-									j.canceled = false
-									j.Status = "Na fila"
-									j.Percent, j.Speed, j.ETA = "", "", ""
-								}
-							}
-							a.table.mu.Unlock()
-							a.table.PublishRowsReset()
-							a.maxConcurrent = concCB.CurrentIndex() + 1
-							a.startQueue()
-						},
-					},
-					PushButton{
-						Text: "Limpar concluídos",
-						OnClicked: func() {
-							a.table.mu.Lock()
-							kept := a.table.items[:0]
-							for _, j := range a.table.items {
-								if j.State == stWaiting || j.State == stRunning {
-									kept = append(kept, j)
-								}
-							}
-							a.table.items = kept
-							a.table.mu.Unlock()
-							a.table.PublishRowsReset()
-						},
-					},
+					PushButton{Text: "Cancelar selecionados", OnClicked: cancelSelected},
+					PushButton{Text: "Tentar de novo", OnClicked: retrySelected},
+					PushButton{Text: "Limpar concluídos", OnClicked: clearDone},
 					HSpacer{},
 					PushButton{
 						Text: "Abrir pasta",
 						OnClicked: func() {
 							dir := strings.TrimSpace(outEdit.Text())
 							_ = os.MkdirAll(dir, 0o755)
-							_ = exec.Command("explorer", dir).Start()
+							openFolder(dir)
 						},
 					},
 					PushButton{
@@ -424,6 +523,19 @@ func (a *SnowApp) run() error {
 	}.Create()
 	if err != nil {
 		return err
+	}
+
+	// Fonte usada para desenhar a barra de progresso na tabela.
+	a.cellFont = tv.Font()
+
+	// Ícone da janela e da bandeja (vem embutido no .exe pelo build).
+	icon := loadAppIcon()
+	_ = a.mw.SetIcon(icon)
+	if ni, err := walk.NewNotifyIcon(); err == nil {
+		_ = ni.SetIcon(icon)
+		_ = ni.SetToolTip(appTitle)
+		_ = ni.SetVisible(true)
+		a.ni = ni
 	}
 
 	// "Colou e foi": quando entra um bloco grande de texto de uma vez (colar),
@@ -474,6 +586,11 @@ func (a *SnowApp) run() error {
 
 	// Nesta versão do walk o loop principal roda via walk.App().Run().
 	walk.App().Run()
+
+	// Tira o ícone da bandeja ao fechar (senão ele fica "fantasma").
+	if a.ni != nil {
+		_ = a.ni.Dispose()
+	}
 	return nil
 }
 
