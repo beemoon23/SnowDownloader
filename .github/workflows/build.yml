@@ -1,0 +1,46 @@
+name: Build SnowDownloader
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Resolver dependências
+        run: go mod tidy
+
+      - name: Embutir manifesto (visual moderno do Windows)
+        run: |
+          go install github.com/akavel/rsrc@latest
+          rsrc -manifest app.manifest -o rsrc.syso
+
+      - name: Checar o código
+        run: go vet ./...
+
+      - name: Compilar
+        run: go build -ldflags "-H=windowsgui -s -w" -o SnowDownloader.exe .
+
+      - name: Guardar o .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: SnowDownloader
+          path: SnowDownloader.exe
+
+      - name: Publicar release (quando houver tag vX.Y.Z)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SnowDownloader.exe
