@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -184,6 +186,41 @@ func (a *SnowApp) startQueue() {
 	}()
 }
 
+// pathFromLine tenta achar o caminho do arquivo numa linha de saída do yt-dlp.
+// Devolve "" quando a linha não fala de um arquivo de vídeo/áudio final.
+func pathFromLine(line string) string {
+	var p string
+	switch {
+	case strings.HasPrefix(line, "[Merger] Merging formats into "):
+		p = strings.Trim(strings.TrimPrefix(line, "[Merger] Merging formats into "), "\"")
+	case strings.HasPrefix(line, "[ExtractAudio] Destination: "):
+		p = strings.TrimPrefix(line, "[ExtractAudio] Destination: ")
+	case strings.HasPrefix(line, "[VideoRemuxer] ") && strings.Contains(line, "Destination: "):
+		p = line[strings.Index(line, "Destination: ")+len("Destination: "):]
+	case strings.HasPrefix(line, "[download] Destination: "):
+		p = strings.TrimPrefix(line, "[download] Destination: ")
+	case strings.HasPrefix(line, "[download] ") && strings.HasSuffix(line, " has already been downloaded"):
+		p = strings.TrimSuffix(strings.TrimPrefix(line, "[download] "), " has already been downloaded")
+	}
+	p = strings.TrimSpace(p)
+
+	// Ignora legendas, miniaturas e arquivos temporários.
+	switch strings.ToLower(filepath.Ext(p)) {
+	case "", ".vtt", ".srt", ".ass", ".lrc", ".json", ".jpg", ".jpeg", ".png", ".webp", ".part", ".ytdl":
+		return ""
+	}
+	return p
+}
+
+// shorten corta um texto longo sem quebrar caracteres acentuados.
+func shorten(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
 func cleanVal(s string) string {
 	s = strings.TrimSpace(s)
 	low := strings.ToLower(s)
@@ -269,8 +306,13 @@ func (a *SnowApp) runJob(j *DlJob) {
 				continue
 			}
 			pct := cleanVal(parts[1])
+			pctVal := -1.0
+			if v, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(parts[1]), "%"), 64); err == nil {
+				pctVal = v
+			}
 			a.table.mu.Lock()
 			j.Percent = pct
+			j.PctVal = pctVal
 			j.Speed = cleanVal(parts[2])
 			j.ETA = cleanVal(parts[3])
 			if t := strings.TrimSpace(parts[4]); t != "" && !strings.EqualFold(t, "NA") {
@@ -292,6 +334,13 @@ func (a *SnowApp) runJob(j *DlJob) {
 			a.setJob(j, "Finalizando arquivo…")
 		case strings.HasPrefix(line, "ERROR:"):
 			lastErr = line
+		}
+
+		// Guarda o caminho do arquivo (o último é o final) para poder abrir depois.
+		if p := pathFromLine(line); p != "" {
+			a.table.mu.Lock()
+			j.FilePath = p
+			a.table.mu.Unlock()
 		}
 	}
 	pr.Close()
@@ -336,8 +385,23 @@ func (a *SnowApp) finish(j *DlJob, st jobState, status string) {
 		j.Speed = ""
 		j.ETA = ""
 	}
+	if st == stDone {
+		j.PctVal = 100
+	}
+	name := j.Title
+	if name == "" {
+		name = j.URL
+	}
 	a.table.mu.Unlock()
 	a.refresh(j)
+
+	// Aviso do Windows (balão na bandeja) quando termina ou falha.
+	switch st {
+	case stDone:
+		a.notify("Download concluído", shorten(name, 90), false)
+	case stError:
+		a.notify("Falha no download", shorten(name, 70)+"\n"+status, true)
+	}
 }
 
 // cancelJob cancela um item (esperando ou em andamento).
