@@ -27,6 +27,7 @@ type jobOptions struct {
 	Playlist    bool
 	LiveFromBeg bool
 	ExtraArgs   string
+	Section     string // valor de --download-sections ("*1:30-5:00"); "" = vídeo inteiro
 }
 
 // DlJob é um item da fila.

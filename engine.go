@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -103,6 +104,10 @@ func (a *SnowApp) buildArgs(j *DlJob) []string {
 	if o.LiveFromBeg {
 		args = append(args, "--live-from-start")
 	}
+	if o.Section != "" {
+		// Baixa só um trecho (ex.: "*1:30-5:00"; "inf" = até o fim).
+		args = append(args, "--download-sections", o.Section)
+	}
 	if o.Cookies > 0 && o.Cookies < len(cookieBrowsers) {
 		args = append(args, "--cookies-from-browser", cookieBrowsers[o.Cookies])
 	}
@@ -127,7 +132,8 @@ func (a *SnowApp) startQueue() {
 	go func() {
 		for {
 			// Espera as ferramentas (yt-dlp/ffmpeg) estarem prontas.
-			if !a.tools.Ready() {
+			// (e também enquanto o yt-dlp está sendo atualizado)
+			if !a.tools.Ready() || atomic.LoadInt32(&a.ytBusy) == 1 {
 				time.Sleep(500 * time.Millisecond)
 				continue
 			}
@@ -392,8 +398,14 @@ func (a *SnowApp) finish(j *DlJob, st jobState, status string) {
 	if name == "" {
 		name = j.URL
 	}
+	link, title, path := j.URL, j.Title, j.FilePath
 	a.table.mu.Unlock()
 	a.refresh(j)
+
+	// Anota no histórico (para avisar se o mesmo link for colado de novo).
+	if st == stDone && a.hist != nil {
+		a.hist.Add(link, title, path)
+	}
 
 	// Aviso do Windows (balão na bandeja) quando termina ou falha.
 	switch st {

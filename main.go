@@ -22,10 +22,16 @@ type SnowApp struct {
 	table    *JobTable
 	tools    ToolPaths
 	settings AppSettings
+	hist     *History
 
-	ni       *walk.NotifyIcon // ícone/balões na bandeja
-	cellFont *walk.Font       // fonte usada para desenhar a barra de progresso
-	selRows  map[int]bool     // linhas selecionadas (só a thread da janela mexe)
+	ni         *walk.NotifyIcon // ícone/balões na bandeja
+	cellFont   *walk.Font       // fonte usada para desenhar a barra de progresso
+	selRows    map[int]bool     // linhas selecionadas (só a thread da janela mexe)
+	trayMin    bool             // minimizar para a bandeja?
+	trayHinted bool             // já mostrou o aviso "continua rodando na bandeja"?
+	persistFn  func()           // grava as opções da tela em disco
+
+	ytBusy int32 // 1 enquanto o yt-dlp está sendo atualizado
 
 	qmu           sync.Mutex
 	queueRunning  bool
@@ -48,10 +54,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	cleanupOldExe() // apaga restos de uma atualização anterior
+
 	a := &SnowApp{
 		table:    &JobTable{},
 		tools:    newToolPaths(),
 		settings: loadSettings(),
+		hist:     loadHistory(),
 		selRows:  map[int]bool{},
 	}
 	if err := a.run(); err != nil {
@@ -84,6 +93,69 @@ func (a *SnowApp) refresh(j *DlJob) {
 	})
 }
 
+// filterNew tira dos links os repetidos e os que já estão na lista
+// (esperando, baixando ou concluídos). Devolve quantos foram ignorados.
+func (a *SnowApp) filterNew(urls []string) ([]string, int) {
+	inList := map[string]bool{}
+	a.table.mu.Lock()
+	for _, it := range a.table.items {
+		if it.State != stError && it.State != stCanceled {
+			inList[normURL(it.URL)] = true
+		}
+	}
+	a.table.mu.Unlock()
+
+	var out []string
+	skipped := 0
+	for _, u := range urls {
+		k := normURL(u)
+		if inList[k] {
+			skipped++
+			continue
+		}
+		inList[k] = true
+		out = append(out, u)
+	}
+	return out, skipped
+}
+
+// askHistory avisa dos links que já foram baixados antes e pergunta se
+// quer baixar de novo. Devolve os links que devem seguir para a fila.
+func (a *SnowApp) askHistory(urls []string) []string {
+	dups := map[string]bool{}
+	var lines []string
+	for _, u := range urls {
+		if e, ok := a.hist.Get(u); ok {
+			dups[normURL(u)] = true
+			name := e.Title
+			if name == "" {
+				name = u
+			}
+			lines = append(lines, fmt.Sprintf("• %s (%s)", shorten(name, 60), time.Unix(e.When, 0).Format("02/01/2006")))
+		}
+	}
+	if len(dups) == 0 {
+		return urls
+	}
+	if len(lines) > 8 {
+		extra := len(lines) - 8
+		lines = append(lines[:8], fmt.Sprintf("… e mais %d", extra))
+	}
+	msg := fmt.Sprintf("%d link(s) já foi(ram) baixado(s) antes:\n\n%s\n\nBaixar de novo mesmo assim?",
+		len(dups), strings.Join(lines, "\n"))
+	if walk.MsgBox(a.mw, appTitle, msg, walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) == walk.DlgCmdYes {
+		return urls
+	}
+
+	var out []string
+	for _, u := range urls {
+		if !dups[normURL(u)] {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
 func (a *SnowApp) run() error {
 	var (
 		urlEdit   *walk.TextEdit
@@ -96,6 +168,10 @@ func (a *SnowApp) run() error {
 		subsCK    *walk.CheckBox
 		playlCK   *walk.CheckBox
 		liveCK    *walk.CheckBox
+		secCK     *walk.CheckBox
+		secFrom   *walk.LineEdit
+		secTo     *walk.LineEdit
+		trayCK    *walk.CheckBox
 		tv        *walk.TableView
 		optsGB    *walk.GroupBox
 
@@ -104,6 +180,7 @@ func (a *SnowApp) run() error {
 
 	s := a.settings
 	a.maxConcurrent = s.Concurrency + 1
+	a.trayMin = s.TrayMin
 
 	// Lê as opções atuais da tela.
 	currentOpts := func() jobOptions {
@@ -119,48 +196,54 @@ func (a *SnowApp) run() error {
 		}
 	}
 
+	// persist grava as opções. Parte das configurações atuais, assim campos
+	// que não têm controle na tela (ex.: data da última atualização do
+	// yt-dlp) não se perdem.
 	persist := func() {
 		o := currentOpts()
-		saveSettings(AppSettings{
-			OutDir:      o.OutDir,
-			Quality:     o.Quality,
-			Cookies:     o.Cookies,
-			Concurrency: concCB.CurrentIndex(),
-			Thumbnail:   o.Thumbnail,
-			Subtitles:   o.Subtitles,
-			Playlist:    o.Playlist,
-			LiveFromBeg: o.LiveFromBeg,
-			ExtraArgs:   o.ExtraArgs,
-		})
+		st := a.settings
+		st.OutDir = o.OutDir
+		st.Quality = o.Quality
+		st.Cookies = o.Cookies
+		st.Concurrency = concCB.CurrentIndex()
+		st.Thumbnail = o.Thumbnail
+		st.Subtitles = o.Subtitles
+		st.Playlist = o.Playlist
+		st.LiveFromBeg = o.LiveFromBeg
+		st.ExtraArgs = o.ExtraArgs
+		st.TrayMin = trayCK.Checked()
+		a.settings = st
+		saveSettings(st)
 	}
+	a.persistFn = persist
 
-	// addURLs lê os links da caixa, coloca na fila e já começa a baixar.
-	// silent=true é o modo "colou e foi": não abre janelinhas de aviso.
-	addURLs := func(silent bool) {
-		if strings.TrimSpace(urlEdit.Text()) == "" {
-			return
-		}
-		raw := strings.ReplaceAll(urlEdit.Text(), "\r", "")
-		var urls []string
-		for _, line := range strings.Split(raw, "\n") {
-			for _, f := range strings.Fields(line) {
-				if strings.HasPrefix(f, "http://") || strings.HasPrefix(f, "https://") {
-					urls = append(urls, f)
-				}
-			}
-		}
-		if len(urls) == 0 {
-			if silent {
-				a.statusLB.SetText("Não achei um link (http:// ou https://) no que você colou.")
-			} else {
-				walk.MsgBox(a.mw, appTitle, "Cole pelo menos um link (começando com http:// ou https://).", walk.MsgBoxIconInformation)
-			}
-			return
-		}
+	// enqueue coloca os links na fila e já começa a baixar.
+	// Devolve false quando algo impediu (pasta vazia, trecho inválido): nesse
+	// caso o texto da caixa é mantido para a pessoa corrigir.
+	enqueue := func(urls []string) bool {
 		opts := currentOpts()
 		if opts.OutDir == "" {
 			walk.MsgBox(a.mw, appTitle, "Escolha a pasta de destino (em \"Mostrar opções\").", walk.MsgBoxIconInformation)
-			return
+			return false
+		}
+		sec, err := sectionArg(secCK.Checked(), secFrom.Text(), secTo.Text())
+		if err != nil {
+			walk.MsgBox(a.mw, appTitle, err.Error(), walk.MsgBoxIconInformation)
+			return false
+		}
+		opts.Section = sec
+
+		urls, skipped := a.filterNew(urls)
+		if len(urls) > 0 {
+			urls = a.askHistory(urls)
+		}
+		if len(urls) == 0 {
+			if skipped > 0 {
+				a.statusLB.SetText("Esse link já está na lista.")
+			} else {
+				a.statusLB.SetText("Nada novo para baixar.")
+			}
+			return true
 		}
 
 		a.maxConcurrent = concCB.CurrentIndex() + 1
@@ -180,10 +263,34 @@ func (a *SnowApp) run() error {
 		a.table.mu.Unlock()
 
 		a.table.PublishRowsInserted(from, to)
-		urlEdit.SetText("")
 		persist()
-		a.statusLB.SetText(fmt.Sprintf("%d link(s) na fila — baixando…", len(urls)))
+		msg := fmt.Sprintf("%d link(s) na fila — baixando…", len(urls))
+		if skipped > 0 {
+			msg += fmt.Sprintf(" (%d repetido(s) ignorado(s))", skipped)
+		}
+		a.statusLB.SetText(msg)
 		a.startQueue()
+		return true
+	}
+
+	// addURLs lê os links da caixa de texto.
+	// silent=true é o modo "colou e foi": não abre janelinhas de aviso.
+	addURLs := func(silent bool) {
+		if strings.TrimSpace(urlEdit.Text()) == "" {
+			return
+		}
+		urls := extractURLs(urlEdit.Text())
+		if len(urls) == 0 {
+			if silent {
+				a.statusLB.SetText("Não achei um link (http:// ou https://) no que você colou.")
+			} else {
+				walk.MsgBox(a.mw, appTitle, "Cole pelo menos um link (começando com http:// ou https://).", walk.MsgBoxIconInformation)
+			}
+			return
+		}
+		if enqueue(urls) {
+			urlEdit.SetText("")
+		}
 	}
 
 	addAndStart := func() { addURLs(false) }
@@ -201,6 +308,27 @@ func (a *SnowApp) run() error {
 		}
 		urlEdit.SetText(cur + strings.TrimSpace(txt))
 		addURLs(false)
+	}
+
+	// Arrastar arquivos (.txt com links, atalhos .url...) para a janela.
+	dropFiles := func(files []string) {
+		var found []string
+		for _, f := range files {
+			st, err := os.Stat(f)
+			if err != nil || st.IsDir() || st.Size() > 4<<20 {
+				continue
+			}
+			b, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			found = append(found, extractURLs(string(b))...)
+		}
+		if len(found) == 0 {
+			a.statusLB.SetText("Não achei links nos arquivos arrastados (use um .txt com um link por linha).")
+			return
+		}
+		enqueue(found)
 	}
 
 	selectedJobs := func() []*DlJob {
@@ -325,19 +453,33 @@ func (a *SnowApp) run() error {
 		a.statusLB.SetText(fmt.Sprintf("%d link(s) copiado(s).", len(urls)))
 	}
 
+	clearHistory := func() {
+		n := a.hist.Count()
+		if n == 0 {
+			walk.MsgBox(a.mw, appTitle, "O histórico já está vazio.", walk.MsgBoxIconInformation)
+			return
+		}
+		msg := fmt.Sprintf("Apagar o histórico de %d vídeo(s) baixado(s)?\n\nOs arquivos baixados não são apagados, só a memória de \"já baixei esse link\".", n)
+		if walk.MsgBox(a.mw, appTitle, msg, walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) == walk.DlgCmdYes {
+			a.hist.Clear()
+			a.statusLB.SetText("Histórico apagado.")
+		}
+	}
+
 	err := MainWindow{
-		AssignTo: &a.mw,
-		Title:    appTitle + " — baixe vídeos, lives, reels e áudios",
-		MinSize:  Size{Width: 820, Height: 480},
-		Size:     Size{Width: 1000, Height: 660},
-		Font:     Font{Family: "Segoe UI", PointSize: 10},
+		AssignTo:    &a.mw,
+		Title:       appTitle + versionSuffix() + " — baixe vídeos, lives, reels e áudios",
+		MinSize:     Size{Width: 820, Height: 480},
+		Size:        Size{Width: 1000, Height: 660},
+		Font:        Font{Family: "Segoe UI", PointSize: 10},
+		OnDropFiles: dropFiles,
 		Layout: VBox{
 			Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 10},
 			Spacing: 8,
 		},
 		Children: []Widget{
 			GroupBox{
-				Title:  "Cole o link (de qualquer site) e o download começa sozinho",
+				Title:  "Cole o link (de qualquer site) e o download começa sozinho — ou arraste um .txt com vários links",
 				Layout: VBox{Margins: Margins{Left: 10, Top: 8, Right: 10, Bottom: 10}, Spacing: 8},
 				Children: []Widget{
 					TextEdit{
@@ -432,6 +574,33 @@ func (a *SnowApp) run() error {
 					Composite{
 						Layout: HBox{MarginsZero: true},
 						Children: []Widget{
+							CheckBox{AssignTo: &secCK, Text: "Baixar só um trecho do vídeo:"},
+							Label{Text: "de"},
+							LineEdit{AssignTo: &secFrom, CueBanner: "0:00", MaxSize: Size{Width: 80}},
+							Label{Text: "até"},
+							LineEdit{AssignTo: &secTo, CueBanner: "fim", MaxSize: Size{Width: 80}},
+							Label{Text: "(ex.: 1:30 e 5:00; vale para os próximos links)"},
+							HSpacer{},
+						},
+					},
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
+							CheckBox{
+								AssignTo: &trayCK,
+								Text:     "Minimizar para a bandeja (perto do relógio)",
+								Checked:  s.TrayMin,
+								OnCheckedChanged: func() {
+									a.trayMin = trayCK.Checked()
+								},
+							},
+							HSpacer{},
+							PushButton{Text: "Limpar histórico", OnClicked: clearHistory},
+						},
+					},
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
 							Label{Text: "Argumentos extras do yt-dlp (avançado):"},
 							LineEdit{AssignTo: &extraEdit, Text: s.ExtraArgs},
 						},
@@ -509,12 +678,18 @@ func (a *SnowApp) run() error {
 									if err != nil {
 										walk.MsgBox(a.mw, appTitle, "Não consegui atualizar:\n\n"+out, walk.MsgBoxIconError)
 									} else {
+										a.settings.LastYtDlpCheck = time.Now().Unix()
+										persist()
 										walk.MsgBox(a.mw, appTitle, "yt-dlp está na versão "+ver+".\n\n"+out, walk.MsgBoxIconInformation)
 									}
 								})
 								a.setStatus("yt-dlp " + ver + " pronto.")
 							}()
 						},
+					},
+					PushButton{
+						Text:      "Atualizar app",
+						OnClicked: func() { a.checkAppUpdate(true) },
 					},
 				},
 			},
@@ -531,12 +706,7 @@ func (a *SnowApp) run() error {
 	// Ícone da janela e da bandeja (vem embutido no .exe pelo build).
 	icon := loadAppIcon()
 	_ = a.mw.SetIcon(icon)
-	if ni, err := walk.NewNotifyIcon(); err == nil {
-		_ = ni.SetIcon(icon)
-		_ = ni.SetToolTip(appTitle)
-		_ = ni.SetVisible(true)
-		a.ni = ni
-	}
+	a.setupTray(icon)
 
 	// "Colou e foi": quando entra um bloco grande de texto de uma vez (colar),
 	// espera um instante e começa a baixar sozinho. Digitar à mão não dispara.
@@ -569,7 +739,8 @@ func (a *SnowApp) run() error {
 		}
 	})
 
-	// Prepara yt-dlp/ffmpeg em segundo plano (baixa só na primeira vez).
+	// Prepara yt-dlp/ffmpeg em segundo plano (baixa só na primeira vez) e,
+	// depois, faz as checagens automáticas de atualização.
 	go func() {
 		if err := a.ensureTools(); err != nil {
 			a.setStatus("Erro ao preparar ferramentas: " + err.Error())
@@ -582,6 +753,7 @@ func (a *SnowApp) run() error {
 			return
 		}
 		a.setStatus("yt-dlp " + a.ytDlpVersion() + " pronto. É só colar o link.")
+		a.autoChecks()
 	}()
 
 	// Nesta versão do walk o loop principal roda via walk.App().Run().

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 )
 
 const (
@@ -207,7 +208,12 @@ func (a *SnowApp) ytDlpVersion() string {
 }
 
 // updateYtDlp roda "yt-dlp -U" (o próprio yt-dlp se atualiza).
+// Enquanto atualiza, a fila de downloads espera (ytBusy), porque o Windows
+// não deixa trocar o yt-dlp.exe com ele em uso.
 func (a *SnowApp) updateYtDlp() (string, error) {
+	atomic.StoreInt32(&a.ytBusy, 1)
+	defer atomic.StoreInt32(&a.ytBusy, 0)
+
 	cmd := exec.Command(a.tools.YtDlp, "-U")
 	hideWindow(cmd)
 	out, err := cmd.CombinedOutput()
