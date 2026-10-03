@@ -1,11 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/tailscale/walk"
 	. "github.com/tailscale/walk/declarative"
@@ -82,6 +85,9 @@ func (a *SnowApp) run() error {
 		playlCK   *walk.CheckBox
 		liveCK    *walk.CheckBox
 		tv        *walk.TableView
+		optsGB    *walk.GroupBox
+
+		showOptsCK *walk.CheckBox
 	)
 
 	s := a.settings
@@ -116,7 +122,12 @@ func (a *SnowApp) run() error {
 		})
 	}
 
-	addAndStart := func() {
+	// addURLs lê os links da caixa, coloca na fila e já começa a baixar.
+	// silent=true é o modo "colou e foi": não abre janelinhas de aviso.
+	addURLs := func(silent bool) {
+		if strings.TrimSpace(urlEdit.Text()) == "" {
+			return
+		}
 		raw := strings.ReplaceAll(urlEdit.Text(), "\r", "")
 		var urls []string
 		for _, line := range strings.Split(raw, "\n") {
@@ -127,12 +138,16 @@ func (a *SnowApp) run() error {
 			}
 		}
 		if len(urls) == 0 {
-			walk.MsgBox(a.mw, appTitle, "Cole pelo menos um link (começando com http:// ou https://).", walk.MsgBoxIconInformation)
+			if silent {
+				a.statusLB.SetText("Não achei um link (http:// ou https://) no que você colou.")
+			} else {
+				walk.MsgBox(a.mw, appTitle, "Cole pelo menos um link (começando com http:// ou https://).", walk.MsgBoxIconInformation)
+			}
 			return
 		}
 		opts := currentOpts()
 		if opts.OutDir == "" {
-			walk.MsgBox(a.mw, appTitle, "Escolha a pasta de destino.", walk.MsgBoxIconInformation)
+			walk.MsgBox(a.mw, appTitle, "Escolha a pasta de destino (em \"Mostrar opções\").", walk.MsgBoxIconInformation)
 			return
 		}
 
@@ -155,7 +170,25 @@ func (a *SnowApp) run() error {
 		a.table.PublishRowsInserted(from, to)
 		urlEdit.SetText("")
 		persist()
+		a.statusLB.SetText(fmt.Sprintf("%d link(s) na fila — baixando…", len(urls)))
 		a.startQueue()
+	}
+
+	addAndStart := func() { addURLs(false) }
+
+	// Botão "Colar e baixar": pega o que está copiado e já começa.
+	pasteAndGo := func() {
+		txt, err := walk.Clipboard().Text()
+		if err != nil || strings.TrimSpace(txt) == "" {
+			a.statusLB.SetText("Nada copiado ainda. Copie um link primeiro.")
+			return
+		}
+		cur := strings.TrimRight(urlEdit.Text(), "\r\n ")
+		if cur != "" {
+			cur += "\r\n"
+		}
+		urlEdit.SetText(cur + strings.TrimSpace(txt))
+		addURLs(false)
 	}
 
 	selectedJobs := func() []*DlJob {
@@ -173,41 +206,39 @@ func (a *SnowApp) run() error {
 	err := MainWindow{
 		AssignTo: &a.mw,
 		Title:    appTitle + " — baixe vídeos, lives, reels e áudios",
-		MinSize:  Size{Width: 860, Height: 640},
-		Size:     Size{Width: 1000, Height: 740},
+		MinSize:  Size{Width: 760, Height: 460},
+		Size:     Size{Width: 960, Height: 620},
 		Layout:   VBox{},
 		Children: []Widget{
 			GroupBox{
-				Title:  "Links (um por linha) — YouTube, Twitch, Instagram, TikTok, X, Facebook, Vimeo, Reddit…",
+				Title:  "Cole o link (de qualquer site) e o download começa sozinho",
 				Layout: VBox{},
 				Children: []Widget{
 					TextEdit{
 						AssignTo: &urlEdit,
 						VScroll:  true,
-						MinSize:  Size{Height: 80},
-						MaxSize:  Size{Height: 130},
+						MinSize:  Size{Height: 56},
+						MaxSize:  Size{Height: 90},
 					},
 					Composite{
 						Layout: HBox{MarginsZero: true},
 						Children: []Widget{
 							PushButton{
-								Text: "Colar da área de transferência",
-								OnClicked: func() {
-									txt, err := walk.Clipboard().Text()
-									if err != nil || strings.TrimSpace(txt) == "" {
-										return
-									}
-									cur := strings.TrimRight(urlEdit.Text(), "\r\n ")
-									if cur != "" {
-										cur += "\r\n"
-									}
-									urlEdit.SetText(cur + strings.TrimSpace(txt))
-								},
+								Text:      "📋  Colar e baixar",
+								MinSize:   Size{Width: 160, Height: 32},
+								OnClicked: pasteAndGo,
 							},
 							HSpacer{},
+							CheckBox{
+								AssignTo: &showOptsCK,
+								Text:     "Mostrar opções",
+								OnCheckedChanged: func() {
+									optsGB.SetVisible(showOptsCK.Checked())
+								},
+							},
 							PushButton{
 								Text:      "▶  Baixar",
-								MinSize:   Size{Width: 140, Height: 32},
+								MinSize:   Size{Width: 120, Height: 32},
 								OnClicked: addAndStart,
 							},
 						},
@@ -215,8 +246,10 @@ func (a *SnowApp) run() error {
 				},
 			},
 			GroupBox{
-				Title:  "Opções",
-				Layout: VBox{},
+				AssignTo: &optsGB,
+				Visible:  false,
+				Title:    "Opções",
+				Layout:   VBox{},
 				Children: []Widget{
 					Composite{
 						Layout: HBox{MarginsZero: true},
@@ -385,6 +418,27 @@ func (a *SnowApp) run() error {
 		return err
 	}
 
+	// "Colou e foi": quando entra um bloco grande de texto de uma vez (colar),
+	// espera um instante e começa a baixar sozinho. Digitar à mão não dispara.
+	prevLen := 0
+	var pasteGen int64
+	urlEdit.TextChanged().Attach(func() {
+		n := len(urlEdit.Text())
+		grew := n - prevLen
+		prevLen = n
+		if grew < 8 {
+			return
+		}
+		gen := atomic.AddInt64(&pasteGen, 1)
+		time.AfterFunc(350*time.Millisecond, func() {
+			if atomic.LoadInt64(&pasteGen) != gen {
+				return // chegou mais texto, esse disparo ficou velho
+			}
+			a.ui(func() { addURLs(true) })
+		})
+	})
+	urlEdit.SetFocus()
+
 	a.mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		persist()
 		a.table.mu.Lock()
@@ -407,7 +461,7 @@ func (a *SnowApp) run() error {
 			})
 			return
 		}
-		a.setStatus("yt-dlp " + a.ytDlpVersion() + " pronto. Cole os links e clique em Baixar.")
+		a.setStatus("yt-dlp " + a.ytDlpVersion() + " pronto. É só colar o link.")
 	}()
 
 	// Nesta versão do walk o loop principal roda via walk.App().Run().
