@@ -41,6 +41,9 @@ type DlJob struct {
 	State   jobState
 	Opts    jobOptions
 
+	FilePath string  // caminho final do arquivo baixado (para abrir depois)
+	PctVal   float64 // 0..100 para a barra de progresso; -1 = sem porcentagem (live)
+
 	canceled bool
 	cmd      *exec.Cmd
 }
