@@ -77,7 +77,14 @@ func (a *SnowApp) buildArgs(j *DlJob) []string {
 	if q.Audio != "" {
 		args = append(args, "-x", "--audio-format", q.Audio, "--audio-quality", "0")
 	} else {
-		args = append(args, "-f", q.Format, "--merge-output-format", "mp4")
+		// -S ordena por: maior resolução, depois prefere vídeo H.264 e áudio
+		// AAC (m4a). Sem isso o YouTube entrega áudio Opus, que dentro de um
+		// .mp4 fica mudo na maioria dos players do Windows.
+		args = append(args,
+			"-f", q.Format,
+			"-S", "res,vcodec:h264,acodec:m4a",
+			"--merge-output-format", "mp4",
+		)
 	}
 
 	if o.Playlist {
