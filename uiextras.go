@@ -19,24 +19,24 @@ var (
 
 // styleCell é chamado pela tabela para cada célula: aqui colorimos o Status
 // e desenhamos a barra de progresso.
-func (a *SnowApp) styleCell(style *walk.CellStyle) {
+func (a *SnowApp) styleCell(t *JobTable, style *walk.CellStyle) {
 	row, col := style.Row(), style.Col()
 	if row < 0 || col < 0 {
 		return
 	}
 
-	a.table.mu.Lock()
-	if row >= len(a.table.items) {
-		a.table.mu.Unlock()
+	t.mu.Lock()
+	if row >= len(t.items) {
+		t.mu.Unlock()
 		return
 	}
-	j := a.table.items[row]
+	j := t.items[row]
 	state, pct, text := j.State, j.PctVal, j.Percent
-	a.table.mu.Unlock()
+	t.mu.Unlock()
 
 	switch col {
 	case 1: // Status
-		if a.selRows[row] {
+		if t.sel[row] {
 			return // linha selecionada: deixa o texto branco padrão
 		}
 		switch state {

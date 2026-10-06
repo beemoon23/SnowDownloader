@@ -20,6 +20,11 @@ type AppSettings struct {
 
 	TrayMin        bool  `json:"trayMin"`        // minimizar para a bandeja
 	LastYtDlpCheck int64 `json:"lastYtDlpCheck"` // unix da última atualização automática do yt-dlp
+
+	// Aba Converter
+	ConvFormat  int    `json:"convFormat"`
+	ConvSameDir bool   `json:"convSameDir"`
+	ConvOutDir  string `json:"convOutDir"`
 }
 
 func defaultSettings() AppSettings {
@@ -31,6 +36,9 @@ func defaultSettings() AppSettings {
 		Concurrency: 1, // índice do combo => 2 downloads simultâneos
 		Thumbnail:   true,
 		TrayMin:     true,
+
+		ConvFormat:  0, // MP4 para WhatsApp
+		ConvSameDir: true,
 	}
 }
 

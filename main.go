@@ -15,29 +15,35 @@ import (
 
 const appTitle = "SnowDownloader"
 
-// SnowApp junta janela, fila e ferramentas.
+// SnowApp junta janela, filas e ferramentas.
 type SnowApp struct {
 	mw       *walk.MainWindow
 	statusLB *walk.Label
-	table    *JobTable
+	table    *JobTable // lista da aba Baixar
+	ctable   *JobTable // lista da aba Converter
 	tools    ToolPaths
 	settings AppSettings
 	hist     *History
 
 	ni         *walk.NotifyIcon // ícone/balões na bandeja
 	cellFont   *walk.Font       // fonte usada para desenhar a barra de progresso
-	selRows    map[int]bool     // linhas selecionadas (só a thread da janela mexe)
 	trayMin    bool             // minimizar para a bandeja?
 	trayHinted bool             // já mostrou o aviso "continua rodando na bandeja"?
 	persistFn  func()           // grava as opções da tela em disco
 
 	ytBusy int32 // 1 enquanto o yt-dlp está sendo atualizado
 
+	// fila de downloads
 	qmu           sync.Mutex
 	queueRunning  bool
 	active        int
 	maxConcurrent int
 	nextID        int
+
+	// fila de conversões
+	cqmu      sync.Mutex
+	cqRunning bool
+	cnextID   int
 }
 
 func init() {
@@ -57,11 +63,11 @@ func main() {
 	cleanupOldExe() // apaga restos de uma atualização anterior
 
 	a := &SnowApp{
-		table:    &JobTable{},
+		table:    &JobTable{sel: map[int]bool{}},
+		ctable:   &JobTable{sel: map[int]bool{}},
 		tools:    newToolPaths(),
 		settings: loadSettings(),
 		hist:     loadHistory(),
-		selRows:  map[int]bool{},
 	}
 	if err := a.run(); err != nil {
 		walk.MsgBox(nil, appTitle, "Erro ao abrir a janela:\n\n"+err.Error(), walk.MsgBoxIconError)
@@ -84,13 +90,18 @@ func (a *SnowApp) setStatus(s string) {
 	})
 }
 
-// refresh redesenha a linha de um job na tabela.
-func (a *SnowApp) refresh(j *DlJob) {
+// refreshIn redesenha a linha de um item na tabela indicada.
+func (a *SnowApp) refreshIn(t *JobTable, j *DlJob) {
 	a.ui(func() {
-		if i := a.table.indexOf(j); i >= 0 {
-			a.table.PublishRowChanged(i)
+		if i := t.indexOf(j); i >= 0 {
+			t.PublishRowChanged(i)
 		}
 	})
+}
+
+// refresh redesenha a linha de um download.
+func (a *SnowApp) refresh(j *DlJob) {
+	a.refreshIn(a.table, j)
 }
 
 // filterNew tira dos links os repetidos e os que já estão na lista
@@ -158,6 +169,9 @@ func (a *SnowApp) askHistory(urls []string) []string {
 
 func (a *SnowApp) run() error {
 	var (
+		tabs *walk.TabWidget
+
+		// aba Baixar
 		urlEdit   *walk.TextEdit
 		outEdit   *walk.LineEdit
 		extraEdit *walk.LineEdit
@@ -172,17 +186,27 @@ func (a *SnowApp) run() error {
 		secFrom   *walk.LineEdit
 		secTo     *walk.LineEdit
 		trayCK    *walk.CheckBox
-		tv        *walk.TableView
 		optsGB    *walk.GroupBox
 
 		showOptsCK *walk.CheckBox
+
+		// aba Converter
+		convCB        *walk.ComboBox
+		convHintTE    *walk.TextEdit
+		sameDirCK     *walk.CheckBox
+		convOutEdit   *walk.LineEdit
+		convBrowseBtn *walk.PushButton
 	)
 
 	s := a.settings
 	a.maxConcurrent = s.Concurrency + 1
 	a.trayMin = s.TrayMin
 
-	// Lê as opções atuais da tela.
+	// Controles das duas listas (ações dos botões, do menu do botão direito e do duplo clique).
+	dl := &listCtl{a: a, t: a.table, cancel: a.cancelJob, start: a.startQueue, what: "link"}
+	cv := &listCtl{a: a, t: a.ctable, cancel: a.cancelConv, start: a.startConvQueue, what: "caminho"}
+
+	// Lê as opções atuais da tela (aba Baixar).
 	currentOpts := func() jobOptions {
 		return jobOptions{
 			OutDir:      strings.TrimSpace(outEdit.Text()),
@@ -212,6 +236,9 @@ func (a *SnowApp) run() error {
 		st.LiveFromBeg = o.LiveFromBeg
 		st.ExtraArgs = o.ExtraArgs
 		st.TrayMin = trayCK.Checked()
+		st.ConvFormat = convCB.CurrentIndex()
+		st.ConvSameDir = sameDirCK.Checked()
+		st.ConvOutDir = strings.TrimSpace(convOutEdit.Text())
 		a.settings = st
 		saveSettings(st)
 	}
@@ -310,8 +337,58 @@ func (a *SnowApp) run() error {
 		addURLs(false)
 	}
 
-	// Arrastar arquivos (.txt com links, atalhos .url...) para a janela.
+	// ---- aba Converter ----
+
+	// addConvPaths põe arquivos (ou pastas) na fila de conversão com o formato escolhido.
+	addConvPaths := func(paths []string) {
+		if len(paths) == 0 {
+			return
+		}
+		same := sameDirCK.Checked()
+		outDir := strings.TrimSpace(convOutEdit.Text())
+		if !same && outDir == "" {
+			walk.MsgBox(a.mw, appTitle, "Escolha a pasta de saída (ou marque \"Salvar na mesma pasta do arquivo original\").", walk.MsgBoxIconInformation)
+			return
+		}
+		idx := convCB.CurrentIndex()
+		if idx < 0 || idx >= len(convFormats) {
+			idx = 0
+		}
+		n := a.addConvFiles(paths, convOptions{Fmt: idx, SameDir: same, OutDir: outDir})
+		if n == 0 {
+			a.statusLB.SetText("Nenhum arquivo novo para converter (já estão na fila, ou a pasta não tem vídeo/áudio).")
+			return
+		}
+		persist()
+		a.statusLB.SetText(fmt.Sprintf("%d arquivo(s) na fila — convertendo para: %s", n, convFormats[idx].Name))
+	}
+
+	addConvDialog := func() {
+		dlg := new(walk.FileDialog)
+		dlg.Title = "Escolha os arquivos para converter"
+		dlg.Filter = "Vídeo e áudio|*.mp4;*.mkv;*.mov;*.avi;*.webm;*.flv;*.wmv;*.m4v;*.3gp;*.ts;*.mpg;*.mpeg;*.mp3;*.m4a;*.wav;*.flac;*.ogg;*.opus;*.aac;*.wma|Todos os arquivos|*.*"
+		if ok, err := dlg.ShowOpenMultiple(a.mw); err == nil && ok {
+			addConvPaths(dlg.FilePaths)
+		}
+	}
+
+	// Atalho do menu da aba Baixar: manda o vídeo baixado para o conversor.
+	convertDownloaded := func() {
+		p := dl.firstFile()
+		if p == "" {
+			return
+		}
+		_ = tabs.SetCurrentIndex(1)
+		addConvPaths([]string{p})
+	}
+
+	// Arrastar arquivos para a janela: na aba Converter são os arquivos a
+	// converter; na aba Baixar são .txt/atalhos com links.
 	dropFiles := func(files []string) {
+		if tabs.CurrentIndex() == 1 {
+			addConvPaths(files)
+			return
+		}
 		var found []string
 		for _, f := range files {
 			st, err := os.Stat(f)
@@ -331,128 +408,6 @@ func (a *SnowApp) run() error {
 		enqueue(found)
 	}
 
-	selectedJobs := func() []*DlJob {
-		var out []*DlJob
-		a.table.mu.Lock()
-		defer a.table.mu.Unlock()
-		for _, i := range tv.SelectedIndexes() {
-			if i >= 0 && i < len(a.table.items) {
-				out = append(out, a.table.items[i])
-			}
-		}
-		return out
-	}
-
-	// ---- ações da lista (botões, menu do botão direito e duplo clique) ----
-
-	cancelSelected := func() {
-		for _, j := range selectedJobs() {
-			a.cancelJob(j)
-		}
-	}
-
-	retrySelected := func() {
-		sel := selectedJobs()
-		a.table.mu.Lock()
-		for _, j := range sel {
-			if j.State == stError || j.State == stCanceled {
-				j.State = stWaiting
-				j.canceled = false
-				j.Status = "Na fila"
-				j.Percent, j.Speed, j.ETA = "", "", ""
-				j.PctVal = 0
-				j.FilePath = ""
-			}
-		}
-		a.table.mu.Unlock()
-		a.table.PublishRowsReset()
-		a.maxConcurrent = concCB.CurrentIndex() + 1
-		a.startQueue()
-	}
-
-	clearDone := func() {
-		a.table.mu.Lock()
-		kept := make([]*DlJob, 0, len(a.table.items))
-		for _, j := range a.table.items {
-			if j.State == stWaiting || j.State == stRunning {
-				kept = append(kept, j)
-			}
-		}
-		a.table.items = kept
-		a.table.mu.Unlock()
-		a.selRows = map[int]bool{}
-		a.table.PublishRowsReset()
-	}
-
-	removeSelected := func() {
-		sel := selectedJobs()
-		if len(sel) == 0 {
-			return
-		}
-		drop := make(map[*DlJob]bool, len(sel))
-		for _, j := range sel {
-			a.cancelJob(j) // se estiver baixando, para antes de tirar
-			drop[j] = true
-		}
-		a.table.mu.Lock()
-		kept := make([]*DlJob, 0, len(a.table.items))
-		for _, j := range a.table.items {
-			if !drop[j] {
-				kept = append(kept, j)
-			}
-		}
-		a.table.items = kept
-		a.table.mu.Unlock()
-		a.selRows = map[int]bool{}
-		a.table.PublishRowsReset()
-	}
-
-	// fileOfFirstSelected devolve o arquivo do primeiro item selecionado,
-	// ou "" (e já avisa na barra de status) se não der para usar.
-	fileOfFirstSelected := func() string {
-		sel := selectedJobs()
-		if len(sel) == 0 {
-			return ""
-		}
-		a.table.mu.Lock()
-		p, st := sel[0].FilePath, sel[0].State
-		a.table.mu.Unlock()
-		switch {
-		case st != stDone:
-			a.statusLB.SetText("Esse download ainda não terminou.")
-			return ""
-		case p == "" || !fileExists(p):
-			a.statusLB.SetText("Não encontrei o arquivo (foi movido ou apagado?).")
-			return ""
-		}
-		return p
-	}
-
-	openSelected := func() {
-		if p := fileOfFirstSelected(); p != "" {
-			openFile(p)
-		}
-	}
-
-	showSelected := func() {
-		if p := fileOfFirstSelected(); p != "" {
-			showInFolder(p)
-		}
-	}
-
-	copyLinks := func() {
-		sel := selectedJobs()
-		if len(sel) == 0 {
-			return
-		}
-		urls := make([]string, 0, len(sel))
-		for _, j := range sel {
-			urls = append(urls, j.URL)
-		}
-		_ = walk.Clipboard().SetText(strings.Join(urls, "\r\n"))
-		a.statusLB.SetText(fmt.Sprintf("%d link(s) copiado(s).", len(urls)))
-	}
-
 	clearHistory := func() {
 		n := a.hist.Count()
 		if n == 0 {
@@ -466,17 +421,14 @@ func (a *SnowApp) run() error {
 		}
 	}
 
-	err := MainWindow{
-		AssignTo:    &a.mw,
-		Title:       appTitle + versionSuffix() + " — baixe vídeos, lives, reels e áudios",
-		MinSize:     Size{Width: 820, Height: 480},
-		Size:        Size{Width: 1000, Height: 660},
-		Font:        Font{Family: "Segoe UI", PointSize: 10},
-		OnDropFiles: dropFiles,
-		Layout: VBox{
-			Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 10},
-			Spacing: 8,
-		},
+	// before das listas de download: relê quantos downloads simultâneos.
+	dl.before = func() { a.maxConcurrent = concCB.CurrentIndex() + 1 }
+
+	// ---- páginas ----
+
+	baixarPage := TabPage{
+		Title:  "Baixar",
+		Layout: VBox{Margins: Margins{Left: 8, Top: 10, Right: 8, Bottom: 8}, Spacing: 8},
 		Children: []Widget{
 			GroupBox{
 				Title:  "Cole o link (de qualquer site) e o download começa sozinho — ou arraste um .txt com vários links",
@@ -608,30 +560,25 @@ func (a *SnowApp) run() error {
 				},
 			},
 			TableView{
-				AssignTo:            &tv,
-				AlternatingRowBG:    true,
-				MultiSelection:      true,
-				ColumnsOrderable:    false,
-				LastColumnStretched: true,
-				CustomRowHeight:     28,
-				Model:               a.table,
-				StyleCell:           a.styleCell,
-				OnItemActivated:     openSelected, // duplo clique / Enter abre o vídeo
-				OnSelectedIndexesChanged: func() {
-					m := make(map[int]bool)
-					for _, i := range tv.SelectedIndexes() {
-						m[i] = true
-					}
-					a.selRows = m
-				},
+				AssignTo:                 &dl.tv,
+				AlternatingRowBG:         true,
+				MultiSelection:           true,
+				ColumnsOrderable:         false,
+				LastColumnStretched:      true,
+				CustomRowHeight:          28,
+				Model:                    a.table,
+				StyleCell:                func(st *walk.CellStyle) { a.styleCell(a.table, st) },
+				OnItemActivated:          dl.openSelected, // duplo clique / Enter abre o vídeo
+				OnSelectedIndexesChanged: dl.onSelection,
 				ContextMenuItems: []MenuItem{
-					Action{Text: "Abrir arquivo", OnTriggered: openSelected},
-					Action{Text: "Mostrar na pasta", OnTriggered: showSelected},
-					Action{Text: "Copiar link", OnTriggered: copyLinks},
+					Action{Text: "Abrir arquivo", OnTriggered: dl.openSelected},
+					Action{Text: "Mostrar na pasta", OnTriggered: dl.showSelected},
+					Action{Text: "Converter este arquivo…", OnTriggered: convertDownloaded},
+					Action{Text: "Copiar link", OnTriggered: dl.copyLinks},
 					Separator{},
-					Action{Text: "Cancelar", OnTriggered: cancelSelected},
-					Action{Text: "Tentar de novo", OnTriggered: retrySelected},
-					Action{Text: "Remover da lista", OnTriggered: removeSelected},
+					Action{Text: "Cancelar", OnTriggered: dl.cancelSelected},
+					Action{Text: "Tentar de novo", OnTriggered: dl.retrySelected},
+					Action{Text: "Remover da lista", OnTriggered: dl.removeSelected},
 				},
 				Columns: []TableViewColumn{
 					{Title: "Título / link", Width: 380},
@@ -644,9 +591,9 @@ func (a *SnowApp) run() error {
 			Composite{
 				Layout: HBox{MarginsZero: true},
 				Children: []Widget{
-					PushButton{Text: "Cancelar selecionados", OnClicked: cancelSelected},
-					PushButton{Text: "Tentar de novo", OnClicked: retrySelected},
-					PushButton{Text: "Limpar concluídos", OnClicked: clearDone},
+					PushButton{Text: "Cancelar selecionados", OnClicked: dl.cancelSelected},
+					PushButton{Text: "Tentar de novo", OnClicked: dl.retrySelected},
+					PushButton{Text: "Limpar concluídos", OnClicked: dl.clearDone},
 					HSpacer{},
 					PushButton{
 						Text: "Abrir pasta",
@@ -693,6 +640,144 @@ func (a *SnowApp) run() error {
 					},
 				},
 			},
+		},
+	}
+
+	converterPage := TabPage{
+		Title:  "Converter",
+		Layout: VBox{Margins: Margins{Left: 8, Top: 10, Right: 8, Bottom: 8}, Spacing: 8},
+		Children: []Widget{
+			GroupBox{
+				Title:  "Converter arquivos que já estão no PC — escolha o formato e arraste os arquivos (ou uma pasta) para a janela",
+				Layout: VBox{Margins: Margins{Left: 10, Top: 8, Right: 10, Bottom: 10}, Spacing: 8},
+				Children: []Widget{
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
+							Label{Text: "Converter para:"},
+							ComboBox{
+								AssignTo:     &convCB,
+								Model:        convNames(),
+								CurrentIndex: clamp(s.ConvFormat, len(convFormats)),
+								MinSize:      Size{Width: 380},
+								OnCurrentIndexChanged: func() {
+									i := convCB.CurrentIndex()
+									if convHintTE != nil && i >= 0 && i < len(convFormats) {
+										convHintTE.SetText(convFormats[i].Hint)
+									}
+								},
+							},
+							HSpacer{},
+							PushButton{
+								Text:      "📂  Adicionar arquivos…",
+								MinSize:   Size{Width: 210, Height: 34},
+								OnClicked: addConvDialog,
+							},
+						},
+					},
+					TextEdit{
+						AssignTo: &convHintTE,
+						ReadOnly: true,
+						Text:     convFormats[clamp(s.ConvFormat, len(convFormats))].Hint,
+						MinSize:  Size{Height: 40},
+						MaxSize:  Size{Height: 52},
+					},
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
+							CheckBox{
+								AssignTo: &sameDirCK,
+								Text:     "Salvar na mesma pasta do arquivo original",
+								Checked:  s.ConvSameDir,
+								OnCheckedChanged: func() {
+									on := !sameDirCK.Checked()
+									convOutEdit.SetEnabled(on)
+									convBrowseBtn.SetEnabled(on)
+								},
+							},
+						},
+					},
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
+							Label{Text: "Pasta de saída:"},
+							LineEdit{AssignTo: &convOutEdit, Text: s.ConvOutDir, Enabled: !s.ConvSameDir},
+							PushButton{
+								AssignTo: &convBrowseBtn,
+								Text:     "Escolher…",
+								Enabled:  !s.ConvSameDir,
+								OnClicked: func() {
+									dlg := new(walk.FileDialog)
+									dlg.Title = "Escolha a pasta de saída"
+									dlg.FilePath = convOutEdit.Text()
+									if ok, err := dlg.ShowBrowseFolder(a.mw); err == nil && ok {
+										convOutEdit.SetText(dlg.FilePath)
+									}
+								},
+							},
+						},
+					},
+					Label{Text: "O arquivo original nunca é apagado nem sobrescrito. O resultado ganha um nome novo se já existir um igual."},
+				},
+			},
+			TableView{
+				AssignTo:                 &cv.tv,
+				AlternatingRowBG:         true,
+				MultiSelection:           true,
+				ColumnsOrderable:         false,
+				LastColumnStretched:      true,
+				CustomRowHeight:          28,
+				Model:                    a.ctable,
+				StyleCell:                func(st *walk.CellStyle) { a.styleCell(a.ctable, st) },
+				OnItemActivated:          cv.openSelected, // duplo clique / Enter abre o arquivo convertido
+				OnSelectedIndexesChanged: cv.onSelection,
+				ContextMenuItems: []MenuItem{
+					Action{Text: "Abrir arquivo convertido", OnTriggered: cv.openSelected},
+					Action{Text: "Mostrar na pasta", OnTriggered: cv.showSelected},
+					Action{Text: "Copiar caminho do original", OnTriggered: cv.copyLinks},
+					Separator{},
+					Action{Text: "Cancelar", OnTriggered: cv.cancelSelected},
+					Action{Text: "Tentar de novo", OnTriggered: cv.retrySelected},
+					Action{Text: "Remover da lista", OnTriggered: cv.removeSelected},
+				},
+				Columns: []TableViewColumn{
+					{Title: "Arquivo", Width: 380},
+					{Title: "Status", Width: 220},
+					{Title: "Progresso", Width: 140},
+					{Title: "Velocidade", Width: 100},
+					{Title: "Restante", Width: 80},
+				},
+			},
+			Composite{
+				Layout: HBox{MarginsZero: true},
+				Children: []Widget{
+					PushButton{Text: "Cancelar selecionados", OnClicked: cv.cancelSelected},
+					PushButton{Text: "Tentar de novo", OnClicked: cv.retrySelected},
+					PushButton{Text: "Limpar concluídos", OnClicked: cv.clearDone},
+					HSpacer{},
+					PushButton{Text: "Abrir arquivo convertido", OnClicked: cv.openSelected},
+					PushButton{Text: "Mostrar na pasta", OnClicked: cv.showSelected},
+				},
+			},
+		},
+	}
+
+	err := MainWindow{
+		AssignTo:    &a.mw,
+		Title:       appTitle + versionSuffix() + " — baixe vídeos, lives, reels e áudios",
+		MinSize:     Size{Width: 820, Height: 520},
+		Size:        Size{Width: 1000, Height: 700},
+		Font:        Font{Family: "Segoe UI", PointSize: 10},
+		OnDropFiles: dropFiles,
+		Layout: VBox{
+			Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 10},
+			Spacing: 8,
+		},
+		Children: []Widget{
+			TabWidget{
+				AssignTo: &tabs,
+				Pages:    []TabPage{baixarPage, converterPage},
+			},
 			Label{AssignTo: &a.statusLB, Text: "Preparando…"},
 		},
 	}.Create()
@@ -700,8 +785,8 @@ func (a *SnowApp) run() error {
 		return err
 	}
 
-	// Fonte usada para desenhar a barra de progresso na tabela.
-	a.cellFont = tv.Font()
+	// Fonte usada para desenhar a barra de progresso nas tabelas.
+	a.cellFont = dl.tv.Font()
 
 	// Ícone da janela e da bandeja (vem embutido no .exe pelo build).
 	icon := loadAppIcon()
@@ -731,11 +816,19 @@ func (a *SnowApp) run() error {
 
 	a.mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		persist()
+
 		a.table.mu.Lock()
 		items := append([]*DlJob(nil), a.table.items...)
 		a.table.mu.Unlock()
 		for _, j := range items {
 			a.cancelJob(j) // não deixa yt-dlp/ffmpeg órfãos rodando
+		}
+
+		a.ctable.mu.Lock()
+		citems := append([]*DlJob(nil), a.ctable.items...)
+		a.ctable.mu.Unlock()
+		for _, j := range citems {
+			a.cancelConv(j)
 		}
 	})
 

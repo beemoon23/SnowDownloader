@@ -2,6 +2,8 @@
 
 App de Windows (janela própria, sem navegador) para baixar vídeos, lives, reels e áudios de
 YouTube, Twitch, Instagram, TikTok, X/Twitter, Facebook, Vimeo, Reddit e mais de mil outros sites.
+Também tem um **conversor de formatos** (MP4 para WhatsApp, OPUS, MP3, MKV, GIF e outros) para
+arquivos que já estão no PC.
 
 Por baixo ele usa o [yt-dlp](https://github.com/yt-dlp/yt-dlp) e o ffmpeg. Na **primeira vez**
 que abre, o app baixa os dois sozinho para a pasta `tools` ao lado do `.exe`
@@ -31,14 +33,14 @@ no máximo uma vez por semana.
 > Cópias compiladas fora do GitHub não têm código de versão e não se atualizam sozinhas.
 > Baixe uma vez pelos links acima e dali em diante é automático.
 
-## Como usar
+## Como usar — aba Baixar
 
 1. **Cole o link** (Ctrl+V na caixa ou botão **Colar e baixar**). O download começa sozinho.
 2. Ou arraste um arquivo `.txt` (um link por linha) para a janela.
 3. Acompanhe na lista. Duplo clique num item concluído abre o vídeo.
 
-Clique com o botão direito num item para: abrir o arquivo, mostrar na pasta, copiar o link,
-cancelar, tentar de novo ou remover da lista.
+Clique com o botão direito num item para: abrir o arquivo, mostrar na pasta, **converter o
+arquivo** (manda para a aba Converter), copiar o link, cancelar, tentar de novo ou remover da lista.
 
 | Recurso | Como |
 |---|---|
@@ -62,6 +64,33 @@ Observações:
 - As opções ficam salvas em `%APPDATA%\SnowDownloader\settings.json` e o histórico em
   `%APPDATA%\SnowDownloader\history.json`.
 
+## Como usar — aba Converter
+
+Converte arquivos que já estão no PC (não precisa ter baixado pelo app).
+
+1. Em **Converter para**, escolha o formato.
+2. **Arraste os arquivos (ou uma pasta inteira)** para a janela, ou use **Adicionar arquivos…**.
+   A conversão começa sozinha, um arquivo por vez, com barra de progresso.
+3. O resultado é salvo ao lado do original (ou na pasta que você escolher). O original nunca é
+   apagado nem sobrescrito. Duplo clique abre o arquivo convertido.
+
+| Formato | Para que serve |
+|---|---|
+| **MP4 para WhatsApp** | H.264 (perfil Main) + AAC, até 720p, `yuv420p`, com dimensões pares. Resolve o MP4 que não toca no WhatsApp |
+| MP4 compatível | H.264 + AAC na resolução original; toca em praticamente qualquer aparelho |
+| MKV | Só troca a "caixa", sem recodificar: rápido e sem perder qualidade |
+| MOV, WebM (VP9 + Opus), AVI | Para editores de vídeo, web e aparelhos antigos |
+| GIF animado | Primeiros 20 s, 480 px, sem áudio |
+| **OPUS voz** | Mono de 32 kbps, o tipo das mensagens de voz do WhatsApp |
+| OPUS música | 128 kbps, ótimo som em pouco espaço |
+| MP3, M4A (AAC), WAV, FLAC, OGG | Áudio nos formatos mais comuns |
+
+Observações:
+
+- Para os formatos de áudio, o arquivo de origem precisa ter áudio (vídeos mudos dão erro).
+- Converter para WebM e vídeos 4K longos é pesado e pode demorar num computador mais fraco.
+- A conversão usa o ffmpeg que o app já baixou; não precisa instalar nada.
+
 ## Como o GitHub compila e publica
 
 A cada commit na `main`, o workflow **Build SnowDownloader** (aba **Actions**):
@@ -79,9 +108,11 @@ Para o ícone entrar no `.exe`, o arquivo `snow.ico` precisa estar na raiz do re
 
 | Arquivo | O que faz |
 |---|---|
-| `main.go` | Janela, botões, fila de links, arrastar arquivo |
+| `main.go` | Janela (abas Baixar e Converter), botões, fila de links, arrastar arquivo |
 | `engine.go` | Monta os comandos do yt-dlp, fila de downloads, progresso |
-| `model.go` | Dados da tabela de downloads |
+| `convert.go` | Conversor de formatos: presets do ffmpeg, fila, progresso |
+| `listctl.go` | Ações das listas (cancelar, tentar de novo, abrir, remover...) |
+| `model.go` | Dados das tabelas de downloads e conversões |
 | `uiextras.go` | Barra de progresso, cores do status, ícone, balões |
 | `tray.go` | Ícone da bandeja e "minimizar para a bandeja" |
 | `update.go` | Atualização automática do próprio app e do yt-dlp |
