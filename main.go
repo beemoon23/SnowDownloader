@@ -170,7 +170,7 @@ func (a *SnowApp) askHistory(urls []string) []string {
 func (a *SnowApp) run() error {
 	var (
 		baixarComp, converterComp *walk.Composite
-		radBaixar, radConv        *walk.RadioButton
+		btnBaixar, btnConv        *walk.PushButton
 		onConv                    bool
 
 		// aba Baixar
@@ -445,7 +445,8 @@ func (a *SnowApp) run() error {
 						MaxSize:  Size{Height: 90},
 					},
 					Composite{
-						Layout: HBox{MarginsZero: true},
+						Layout:  HBox{MarginsZero: true},
+						MaxSize: Size{Height: 40},
 						Children: []Widget{
 							PushButton{
 								Text:      "📋  Colar e baixar",
@@ -564,6 +565,7 @@ func (a *SnowApp) run() error {
 				},
 			},
 			TableView{
+				StretchFactor:            10,
 				AssignTo:                 &dl.tv,
 				AlternatingRowBG:         true,
 				MultiSelection:           true,
@@ -726,6 +728,7 @@ func (a *SnowApp) run() error {
 				},
 			},
 			TableView{
+				StretchFactor:            10,
 				AssignTo:                 &cv.tv,
 				AlternatingRowBG:         true,
 				MultiSelection:           true,
@@ -780,12 +783,11 @@ func (a *SnowApp) run() error {
 		},
 		Children: []Widget{
 			Composite{
-				Layout:  HBox{Margins: Margins{Left: 4, Top: 4, Right: 4, Bottom: 4}, Spacing: 24},
-				MinSize: Size{Height: 36},
-				MaxSize: Size{Height: 36},
+				Layout:  HBox{MarginsZero: true, Spacing: 8},
+				MaxSize: Size{Height: 40},
 				Children: []Widget{
-					RadioButton{AssignTo: &radBaixar, Text: "Baixar", MinSize: Size{Width: 90, Height: 28}, OnClicked: func() { showPage(0) }},
-					RadioButton{AssignTo: &radConv, Text: "Converter", MinSize: Size{Width: 110, Height: 28}, OnClicked: func() { showPage(1) }},
+					PushButton{AssignTo: &btnBaixar, Text: "Baixar", MinSize: Size{Width: 130, Height: 34}, OnClicked: func() { showPage(0) }},
+					PushButton{AssignTo: &btnConv, Text: "Converter", MinSize: Size{Width: 130, Height: 34}, OnClicked: func() { showPage(1) }},
 					HSpacer{},
 				},
 			},
@@ -801,8 +803,13 @@ func (a *SnowApp) run() error {
 	// showPage alterna entre as duas telas (substitui as abas nativas).
 	showPage = func(i int) {
 		onConv = i == 1
-		radBaixar.SetChecked(!onConv)
-		radConv.SetChecked(onConv)
+		if onConv {
+			_ = btnBaixar.SetText("Baixar")
+			_ = btnConv.SetText("●  Converter")
+		} else {
+			_ = btnBaixar.SetText("●  Baixar")
+			_ = btnConv.SetText("Converter")
+		}
 		baixarComp.SetVisible(!onConv)
 		converterComp.SetVisible(onConv)
 	}
