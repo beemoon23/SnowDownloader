@@ -169,7 +169,9 @@ func (a *SnowApp) askHistory(urls []string) []string {
 
 func (a *SnowApp) run() error {
 	var (
-		tabs *walk.TabWidget
+		baixarComp, converterComp *walk.Composite
+		btnBaixar, btnConv        *walk.PushButton
+		onConv                    bool
 
 		// aba Baixar
 		urlEdit   *walk.TextEdit
@@ -372,20 +374,22 @@ func (a *SnowApp) run() error {
 		}
 	}
 
+	var showPage func(int)
+
 	// Atalho do menu da aba Baixar: manda o vídeo baixado para o conversor.
 	convertDownloaded := func() {
 		p := dl.firstFile()
 		if p == "" {
 			return
 		}
-		_ = tabs.SetCurrentIndex(1)
+		showPage(1)
 		addConvPaths([]string{p})
 	}
 
 	// Arrastar arquivos para a janela: na aba Converter são os arquivos a
 	// converter; na aba Baixar são .txt/atalhos com links.
 	dropFiles := func(files []string) {
-		if tabs.CurrentIndex() == 1 {
+		if onConv {
 			addConvPaths(files)
 			return
 		}
@@ -426,9 +430,9 @@ func (a *SnowApp) run() error {
 
 	// ---- páginas ----
 
-	baixarPage := TabPage{
-		Title:  "Baixar",
-		Layout: VBox{MarginsZero: true, Spacing: 8},
+	baixarPage := Composite{
+		AssignTo: &baixarComp,
+		Layout:   VBox{Margins: Margins{Left: 0, Top: 4, Right: 0, Bottom: 0}, Spacing: 8},
 		Children: []Widget{
 			GroupBox{
 				Title:  "Cole o link (de qualquer site) e o download começa sozinho — ou arraste um .txt com vários links",
@@ -645,9 +649,10 @@ func (a *SnowApp) run() error {
 		},
 	}
 
-	converterPage := TabPage{
-		Title:  "Converter",
-		Layout: VBox{MarginsZero: true, Spacing: 8},
+	converterPage := Composite{
+		AssignTo: &converterComp,
+		Visible:  false,
+		Layout:   VBox{Margins: Margins{Left: 0, Top: 4, Right: 0, Bottom: 0}, Spacing: 8},
 		Children: []Widget{
 			GroupBox{
 				Title:  "Converter arquivos que já estão no PC — escolha o formato e arraste os arquivos (ou uma pasta) para a janela",
@@ -777,10 +782,16 @@ func (a *SnowApp) run() error {
 			Spacing: 8,
 		},
 		Children: []Widget{
-			TabWidget{
-				AssignTo: &tabs,
-				Pages:    []TabPage{baixarPage, converterPage},
+			Composite{
+				Layout: HBox{Margins: Margins{Left: 0, Top: 2, Right: 0, Bottom: 6}, Spacing: 8},
+				Children: []Widget{
+					PushButton{AssignTo: &btnBaixar, Text: "Baixar", MinSize: Size{Width: 130}, OnClicked: func() { showPage(0) }},
+					PushButton{AssignTo: &btnConv, Text: "Converter", MinSize: Size{Width: 130}, OnClicked: func() { showPage(1) }},
+					HSpacer{},
+				},
 			},
+			baixarPage,
+			converterPage,
 			Label{AssignTo: &a.statusLB, Text: "Preparando…"},
 		},
 	}.Create()
@@ -788,10 +799,21 @@ func (a *SnowApp) run() error {
 		return err
 	}
 
-	// Trocar de aba reexibe os filhos da página; reaplica o "Mostrar opções".
-	applyOpts := func() { optsGB.SetVisible(showOptsCK.Checked()) }
-	tabs.CurrentIndexChanged().Attach(applyOpts)
-	applyOpts()
+	// showPage alterna entre as duas telas.
+	showPage = func(i int) {
+		onConv = i == 1
+		if onConv {
+			_ = btnBaixar.SetText("Baixar")
+			_ = btnConv.SetText("●  Converter")
+		} else {
+			_ = btnBaixar.SetText("●  Baixar")
+			_ = btnConv.SetText("Converter")
+		}
+		baixarComp.SetVisible(!onConv)
+		converterComp.SetVisible(onConv)
+		optsGB.SetVisible(showOptsCK.Checked())
+	}
+	showPage(0)
 
 	// Fonte usada para desenhar a barra de progresso nas tabelas.
 	a.cellFont = dl.tv.Font()
