@@ -780,10 +780,12 @@ func (a *SnowApp) run() error {
 		},
 		Children: []Widget{
 			Composite{
-				Layout: HBox{MarginsZero: true, Spacing: 16},
+				Layout:  HBox{Margins: Margins{Left: 4, Top: 4, Right: 4, Bottom: 4}, Spacing: 24},
+				MinSize: Size{Height: 36},
+				MaxSize: Size{Height: 36},
 				Children: []Widget{
-					RadioButton{AssignTo: &radBaixar, Text: "⬇  Baixar", OnClicked: func() { showPage(0) }},
-					RadioButton{AssignTo: &radConv, Text: "🔄  Converter", OnClicked: func() { showPage(1) }},
+					RadioButton{AssignTo: &radBaixar, Text: "Baixar", MinSize: Size{Width: 90, Height: 28}, OnClicked: func() { showPage(0) }},
+					RadioButton{AssignTo: &radConv, Text: "Converter", MinSize: Size{Width: 110, Height: 28}, OnClicked: func() { showPage(1) }},
 					HSpacer{},
 				},
 			},
